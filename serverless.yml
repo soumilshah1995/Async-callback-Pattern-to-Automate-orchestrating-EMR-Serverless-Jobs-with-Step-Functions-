@@ -1,0 +1,165 @@
+service: emr-orchestrating
+frameworkVersion: '3'
+
+useDotenv: true
+
+provider:
+  name: aws
+  runtime: python3.9
+  timeout: 200
+  memorySize: 300
+
+plugins:
+  - serverless-python-requirements
+  - serverless-step-functions
+
+
+custom:
+  pythonRequirements:
+    dockerizePip: true
+    zip: true
+
+package:
+  exclude:
+    - '**/*'
+  include:
+    - '*.py'
+
+resources:
+  Resources:
+
+    CallBackQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${env:QueueName}
+        VisibilityTimeout: 600
+
+    S3Bucket:
+      Type: 'AWS::S3::Bucket'
+      Properties:
+        BucketName: ${env:BucketName}
+
+    EMRServerlessS3RuntimeRole:
+      Type: 'AWS::IAM::Role'
+      Properties:
+        RoleName: ${env:RoleName}
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: "Allow"
+              Principal:
+                Service: emr-serverless.amazonaws.com
+              Action: 'sts:AssumeRole'
+
+    EMRServerlessS3AndGlueAccessPolicy:
+      Type: 'AWS::IAM::ManagedPolicy'
+      Properties:
+        ManagedPolicyName: ${env:ManagedPolicyName}
+        Description: EMRServerlessS3AndGlueAccessPolicy
+        Roles:
+          - !Ref EMRServerlessS3RuntimeRole
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Sid: ReadAccessForEMRSamples
+              Effect: Allow
+              Action:
+                - 's3:GetObject'
+                - 's3:ListBucket'
+              Resource:
+                - 'arn:aws:s3:::*.elasticmapreduce'
+                - 'arn:aws:s3:::*.elasticmapreduce/*'
+                - 'arn:aws:s3:::aws-data-analytics-workshops'
+                - 'arn:aws:s3:::aws-data-analytics-workshops/*'
+            - Sid: FullAccessToOutputBucket
+              Effect: Allow
+              Action:
+                - 's3:PutObject'
+                - 's3:GetObject'
+                - 's3:ListBucket'
+                - 's3:DeleteObject'
+              Resource:
+                - !Join
+                  - ''
+                  - - 'arn:aws:s3:::'
+                    - !Ref S3Bucket
+                - !Join
+                  - ''
+                  - - 'arn:aws:s3:::'
+                    - !Ref S3Bucket
+                    - /*
+            - Sid: GlueCreateAndReadDataCatalog
+              Effect: Allow
+              Action:
+                - 'glue:GetDatabase'
+                - 'glue:CreateDatabase'
+                - 'glue:GetDataBases'
+                - 'glue:CreateTable'
+                - 'glue:GetTable'
+                - 'glue:UpdateTable'
+                - 'glue:DeleteTable'
+                - 'glue:GetTables'
+                - 'glue:GetPartition'
+                - 'glue:GetPartitions'
+                - 'glue:CreatePartition'
+                - 'glue:DeletePartition'
+                - 'glue:BatchCreatePartition'
+                - 'glue:ListSchemas'
+                - 'glue:GetUserDefinedFunctions'
+              Resource:
+                - '*'
+
+
+functions:
+  fire-emr-job:
+    handler: handler.lambda_handler_test_emr
+    environment:
+      DEV_ACCESS_KEY: ${env:DEV_ACCESS_KEY}
+      DEV_SECRET_KEY: ${env:DEV_SECRET_KEY}
+      DEV_REGION: ${env:DEV_REGION}
+      ROLE_ARN: ${env:ROLE_ARN}
+    events:
+      - sqs:
+          arn:
+            Fn::GetAtt:
+              - CallBackQueue
+              - Arn
+
+  success:
+    handler: handler.success
+
+  failure:
+    handler: handler.failure
+
+
+stepFunctions:
+  stateMachines:
+    callbackpattern:
+      definition:
+        StartAt: StartEmrJobAndWaitForCallBack
+        States:
+          StartEmrJobAndWaitForCallBack:
+            Type: Task
+            Resource: arn:aws:states:::sqs:sendMessage.waitForTaskToken
+            Parameters:
+              QueueUrl:
+                Ref: CallBackQueue
+              MessageBody:
+                input.$: "$"
+                myTaskToken.$: "$$.Task.Token"
+            Catch:
+              - ErrorEquals: [ "States.TaskFailed" ]
+                Next: ErrorTask
+              - ErrorEquals: [ "States.ALL" ]
+                Next: ErrorTask
+            Next: SuccessTask
+          SuccessTask:
+            Type: Task
+            Resource:
+              Fn::GetAtt: [ success, Arn ]
+            End: true
+          ErrorTask:
+            Type: Task
+            Resource:
+              Fn::GetAtt: [ failure, Arn ]
+            End: true
